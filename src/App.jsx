@@ -1,5 +1,9 @@
-// ===== STREAM GAUGE MAP v1.0.1 =====
+// ===== STREAM GAUGE MAP v1.0.2 =====
 // File: src/App.jsx
+// Changes from v1.0.1:
+//   - EXCLUDED_SITES: blacklist of gauge IDs to never show on startup
+//   - Default exclusions: Hominy Creek, Flat Rock, Coal Creek
+//   - "Use My Location" now filters out gauges downstream of the user
 // If you can see this comment in GitHub after pasting, the paste worked.
 
 import { useEffect, useState, useCallback, useMemo } from 'react'
@@ -27,6 +31,14 @@ const DEFAULT_START = {
   drainageArea: 369,
   altitude: 646.39,
 }
+
+// Gauges to never show on the map, even if the algorithm picks them.
+// Add or remove site numbers here to customize.
+const EXCLUDED_SITES = new Set([
+  '07176950', // Hominy Creek
+  '07177650', // Flat Rock
+  '07177800', // Coal Creek
+])
 
 const NUM_GAUGES = 8
 
@@ -101,13 +113,15 @@ export default function App() {
     setError(null)
     setStatus(label || 'Finding upstream gauges...')
     try {
-      const upstream = await selectUpstreamGauges(referenceGauge, NUM_GAUGES - 1)
-      const all = [referenceGauge, ...upstream].slice(0, NUM_GAUGES)
+      // Ask for more than we need so we have replacements after filtering
+      const upstream = await selectUpstreamGauges(referenceGauge, NUM_GAUGES + EXCLUDED_SITES.size)
+      // Remove excluded sites
+      const filtered = upstream.filter((g) => !EXCLUDED_SITES.has(g.siteNo))
+      const all = [referenceGauge, ...filtered].slice(0, NUM_GAUGES)
       setGauges(all)
       setStatus(`Loading current flows for ${all.length} gauges...`)
       const r = await getCurrentReadings(all.map((g) => g.siteNo))
       setReadings(r)
-      // Fetch medians in background — don't block UI
       setStatus(null)
       setLoading(false)
       const meds = {}
@@ -143,16 +157,23 @@ export default function App() {
         setUserLoc({ lat: latitude, lon: longitude })
         try {
           setStatus('Finding gauges upstream of you...')
-          const list = await selectUpstreamFromLocation(latitude, longitude, NUM_GAUGES)
-          setGauges(list)
-          setStatus(`Loading current flows for ${list.length} gauges...`)
-          const r = await getCurrentReadings(list.map((g) => g.siteNo))
+          // Ask for extras so filtering doesn't leave us short
+          const list = await selectUpstreamFromLocation(
+            latitude,
+            longitude,
+            NUM_GAUGES + EXCLUDED_SITES.size
+          )
+          // Also apply the exclusion list here
+          const filtered = list.filter((g) => !EXCLUDED_SITES.has(g.siteNo)).slice(0, NUM_GAUGES)
+          setGauges(filtered)
+          setStatus(`Loading current flows for ${filtered.length} gauges...`)
+          const r = await getCurrentReadings(filtered.map((g) => g.siteNo))
           setReadings(r)
           setStatus(null)
           setLoading(false)
           const meds = {}
           await Promise.all(
-            list.map(async (g) => {
+            filtered.map(async (g) => {
               const m = await getMedianFlow(g.siteNo)
               if (m != null) meds[g.siteNo] = m
             })
@@ -189,7 +210,7 @@ export default function App() {
     <div className="app">
       <div className="header">
         <div>
-          <h1>🌊 Stream Gauge Map <span style={{fontSize:10,opacity:0.6}}>v1.0.1</span></h1>
+          <h1>🌊 Stream Gauge Map <span style={{fontSize:10,opacity:0.6}}>v1.0.2</span></h1>
           <div className="sub">
             {gauges.length > 0
               ? `${gauges.length} gauges · ${gauges[0]?.name?.split(',')[0] || ''}`

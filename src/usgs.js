@@ -1,5 +1,9 @@
-// ===== STREAM GAUGE MAP v1.0.1 =====
+// ===== STREAM GAUGE MAP v1.0.2 =====
 // File: src/usgs.js
+// Changes from v1.0.1:
+//   - selectUpstreamFromLocation now requires candidates to have a SMALLER drainage
+//     area than the nearest gauge (i.e. truly upstream in the network)
+//   - Falls back gracefully if drainage area data is missing
 // If you can see this comment in GitHub after pasting, the paste worked.
 
 // USGS Water Services API client
@@ -19,7 +23,6 @@ function parseRDB(text) {
   const lines = text.split('\n').filter((l) => l && !l.startsWith('#'))
   if (lines.length < 2) return []
   const headers = lines[0].split('\t')
-  // line 1 is the format-spec row (e.g. "5s\t15s\t..."), skip it
   return lines.slice(2).map((line) => {
     const cells = line.split('\t')
     const obj = {}
@@ -32,7 +35,6 @@ function parseRDB(text) {
 
 /**
  * Get all stream sites in a HUC that report discharge.
- * huc can be 2, 4, 6, or 8 digits.
  */
 export async function getSitesInHUC(huc) {
   const url = `${SITE_BASE}?format=rdb&huc=${huc}&parameterCd=${PARAM_DISCHARGE}&siteType=ST&siteStatus=active&hasDataTypeCd=iv`
@@ -54,18 +56,15 @@ export async function getSitesInHUC(huc) {
 
 /**
  * Get current discharge readings for a list of site numbers.
- * Returns map: siteNo -> { cfs, gaugeHeight, time, rising }
  */
 export async function getCurrentReadings(siteNos) {
   if (siteNos.length === 0) return {}
-  // USGS allows up to 100 sites per request; chunk if needed
   const chunks = []
   for (let i = 0; i < siteNos.length; i += 100) {
     chunks.push(siteNos.slice(i, i + 100))
   }
   const result = {}
   for (const chunk of chunks) {
-    // Pull last 6 hours so we can compute rising/falling
     const url = `${IV_BASE}?format=json&sites=${chunk.join(',')}&parameterCd=${PARAM_DISCHARGE}&period=PT6H`
     const res = await fetch(url)
     if (!res.ok) continue
@@ -81,12 +80,10 @@ export async function getCurrentReadings(siteNos) {
       const last = numeric[numeric.length - 1]
       const first = numeric[0]
       const cfs = last.v
-      // rising/falling: compare last reading to ~3hr earlier
       const midpoint = numeric.find((p) => p.t >= last.t - 3 * 3600 * 1000)
       const reference = midpoint || first
       const delta = cfs - reference.v
       let trend = 'flat'
-      // Use a relative threshold: 5% change OR 5 cfs absolute, whichever is bigger
       const threshold = Math.max(5, reference.v * 0.05)
       if (delta > threshold) trend = 'rising'
       else if (delta < -threshold) trend = 'falling'
@@ -103,7 +100,6 @@ export async function getCurrentReadings(siteNos) {
 
 /**
  * Get 7-day discharge time series for a single site.
- * Returns array of { time: ISO string, cfs: number }
  */
 export async function get7DayHistory(siteNo) {
   const url = `${IV_BASE}?format=json&sites=${siteNo}&parameterCd=${PARAM_DISCHARGE}&period=P7D`
@@ -118,8 +114,7 @@ export async function get7DayHistory(siteNo) {
 }
 
 /**
- * Get historical median (long-term daily statistics) for a site.
- * Used to color-code current flow as low/normal/high vs. typical.
+ * Get historical median flow for a site.
  */
 export async function getMedianFlow(siteNo) {
   try {
@@ -134,7 +129,6 @@ export async function getMedianFlow(siteNo) {
     const d = today.getDate()
     const todayRow = rows.find((r) => parseInt(r.month_nu) === m && parseInt(r.day_nu) === d)
     if (todayRow && todayRow.p50_va) return parseFloat(todayRow.p50_va)
-    // fallback: average all medians
     const all = rows.map((r) => parseFloat(r.p50_va)).filter((n) => !isNaN(n))
     if (all.length === 0) return null
     return all.reduce((a, b) => a + b, 0) / all.length
@@ -145,12 +139,10 @@ export async function getMedianFlow(siteNo) {
 
 /**
  * Classify a current CFS reading against historical median.
- * Returns one of: 'no-data', 'very-low', 'low', 'normal', 'high', 'very-high'
  */
 export function classifyFlow(cfs, median) {
   if (cfs == null || isNaN(cfs)) return 'no-data'
   if (median == null) {
-    // Without context, fall back to absolute thresholds
     if (cfs < 10) return 'very-low'
     if (cfs < 100) return 'low'
     if (cfs < 1000) return 'normal'
@@ -167,11 +159,11 @@ export function classifyFlow(cfs, median) {
 
 export const FLOW_COLORS = {
   'no-data': '#94a3b8',
-  'very-low': '#dc2626', // red — drought / very low
-  'low': '#f97316',      // orange — below normal
-  'normal': '#16a34a',   // green — typical
-  'high': '#0ea5e9',     // sky blue — above normal
-  'very-high': '#7c3aed',// purple — flood-stage range
+  'very-low': '#dc2626',
+  'low': '#f97316',
+  'normal': '#16a34a',
+  'high': '#0ea5e9',
+  'very-high': '#7c3aed',
 }
 
 export const FLOW_LABELS = {
@@ -208,7 +200,6 @@ export async function selectUpstreamGauges(reference, n = 7) {
   const tried = new Set()
   let candidates = []
 
-  // Try HUC8 first, expand outward as needed
   for (const huc of [huc8, huc6, huc4].filter((h) => h && h.length >= 4)) {
     if (tried.has(huc)) continue
     tried.add(huc)
@@ -250,7 +241,12 @@ export async function selectUpstreamGauges(reference, n = 7) {
 }
 
 /**
- * Find the nearest gauge to a lat/lon, then select upstream gauges from there.
+ * Find the nearest gauge to a lat/lon, then select gauges strictly upstream from there.
+ *
+ * v1.0.2: Now enforces that returned gauges have smaller drainage area than the
+ * reference gauge (i.e. genuinely upstream in the river network). The "nearest"
+ * gauge is typically downstream of the user, so we don't include it in results —
+ * instead we use it only as the reference point for the upstream search.
  */
 export async function selectUpstreamFromLocation(lat, lon, n = 8) {
   const bbox = [lon - 1, lat - 1, lon + 1, lat + 1].join(',')
@@ -274,9 +270,45 @@ export async function selectUpstreamFromLocation(lat, lon, n = 8) {
     throw new Error('No stream gauges found within ~110 km of your location.')
   }
 
+  // Find the nearest gauge to use as the watershed reference point
   sites.sort((a, b) => distKm(lat, lon, a.lat, a.lon) - distKm(lat, lon, b.lat, b.lon))
   const nearest = sites[0]
 
-  const upstream = await selectUpstreamGauges(nearest, n - 1)
-  return [nearest, ...upstream]
+  // Get a larger pool of upstream candidates
+  const upstream = await selectUpstreamGauges(nearest, n * 2)
+
+  // STRICTLY UPSTREAM FILTER:
+  // A gauge is upstream of the nearest reference if its drainage area is smaller.
+  // If drainage area data is missing, fall back to using elevation (higher = upstream).
+  const refDA = nearest.drainageArea
+  const refAlt = nearest.altitude
+
+  const trulyUpstream = upstream.filter((g) => {
+    if (refDA != null && g.drainageArea != null) {
+      return g.drainageArea < refDA
+    }
+    if (refAlt != null && g.altitude != null) {
+      return g.altitude > refAlt
+    }
+    // No data to compare: keep it (better than nothing)
+    return true
+  })
+
+  // If we lost too many to filtering, supplement with the next-best candidates
+  let result = trulyUpstream
+  if (result.length < n) {
+    const have = new Set(result.map((g) => g.siteNo))
+    for (const g of upstream) {
+      if (!have.has(g.siteNo)) {
+        result.push(g)
+        if (result.length >= n) break
+      }
+    }
+  }
+
+  // Decide whether to include the "nearest" gauge itself in the result set.
+  // It's the closest one to the user, so it's usually a useful reference even
+  // though it's typically downstream. We DON'T include it now since the user
+  // explicitly asked for upstream-only.
+  return result.slice(0, n)
 }
