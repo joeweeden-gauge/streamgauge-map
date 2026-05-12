@@ -1,10 +1,10 @@
-// ===== STREAM GAUGE MAP v1.0.5 =====
+// ===== STREAM GAUGE MAP v1.0.6 =====
 // File: src/usgs.js
-// Changes from v1.0.4:
-//   - iPhone 400 fix: bbox coords rounded to 4 decimals, progressive sizing
-//   - NEW: getGaugeHeightFallback() - pulls gage height (ft) when discharge unavailable
-//   - NEW: selectUpstreamGaugesIncludingHeightOnly() - finds gauges that report
-//     EITHER discharge OR gauge height, used by the default startup view only
+// Changes from v1.0.5:
+//   - getGaugeHeightFallback: now ALWAYS returns height for the startup view
+//     (no longer just a fallback when discharge is missing)
+//   - get7DayHistoryHeight: returns full 7-day series for height-based classification
+//   - classifyHeight: NEW - classifies current height vs the gauge's 7-day average
 
 const SITE_BASE = 'https://waterservices.usgs.gov/nwis/site/'
 const IV_BASE = 'https://waterservices.usgs.gov/nwis/iv/'
@@ -28,10 +28,6 @@ function parseRDB(text) {
   })
 }
 
-/**
- * Get all stream sites in a HUC that report a given parameter.
- * paramCd defaults to discharge.
- */
 export async function getSitesInHUC(huc, paramCd = PARAM_DISCHARGE) {
   const url = `${SITE_BASE}?format=rdb&huc=${huc}&parameterCd=${paramCd}&siteType=ST&siteStatus=active&hasDataTypeCd=iv`
   const res = await fetch(url)
@@ -124,12 +120,12 @@ export async function getDailyValueFallback(siteNo) {
 }
 
 /**
- * NEW: Pull current gauge height (in feet) for a site when discharge is unavailable.
- * Returns reading with `feet` instead of `cfs` and `source: 'height'`.
+ * Get current gauge height (feet) plus a 7-day average for classification.
+ * Returns: { feet, time, trend, delta, source: 'height', sevenDayAvg }
  */
-export async function getGaugeHeightFallback(siteNo) {
+export async function getHeightReading(siteNo) {
   try {
-    const url = `${IV_BASE}?format=json&sites=${siteNo}&parameterCd=${PARAM_GAUGE_HEIGHT}&period=PT6H`
+    const url = `${IV_BASE}?format=json&sites=${siteNo}&parameterCd=${PARAM_GAUGE_HEIGHT}&period=P7D`
     const res = await fetch(url)
     if (!res.ok) return null
     const data = await res.json()
@@ -140,25 +136,30 @@ export async function getGaugeHeightFallback(siteNo) {
       .filter((p) => !isNaN(p.v) && p.v > -999)
     if (values.length === 0) return null
     const last = values[values.length - 1]
-    const first = values[0]
     const feet = last.v
-    const midpoint = values.find((p) => p.t >= last.t - 3 * 3600 * 1000)
-    const reference = midpoint || first
-    const delta = feet - reference.v
+
+    // 3-hour trend
+    const midpoint = values.find((p) => p.t >= last.t - 3 * 3600 * 1000) || values[0]
+    const delta = feet - midpoint.v
     let trend = 'flat'
-    // For gauge height, use a 0.1 ft / 5% threshold
-    const threshold = Math.max(0.1, reference.v * 0.05)
+    const threshold = Math.max(0.1, midpoint.v * 0.05)
     if (delta > threshold) trend = 'rising'
     else if (delta < -threshold) trend = 'falling'
+
+    // 7-day average — for classification
+    const sevenDayAvg =
+      values.reduce((sum, p) => sum + p.v, 0) / values.length
+
     return {
       feet,
       time: new Date(last.t).toISOString(),
       trend,
       delta,
       source: 'height',
+      sevenDayAvg,
     }
   } catch (e) {
-    console.warn(`Height fallback failed for ${siteNo}:`, e)
+    console.warn(`Height reading failed for ${siteNo}:`, e)
     return null
   }
 }
@@ -195,9 +196,6 @@ export async function get7DayHistory(siteNo) {
   }
 }
 
-/**
- * NEW: 7-day gauge height history (in feet) — used for height-only gauges.
- */
 export async function get7DayHistoryHeight(siteNo) {
   try {
     const url = `${IV_BASE}?format=json&sites=${siteNo}&parameterCd=${PARAM_GAUGE_HEIGHT}&period=P7D`
@@ -235,6 +233,9 @@ export async function getMedianFlow(siteNo) {
   }
 }
 
+/**
+ * Classify discharge against historical median.
+ */
 export function classifyFlow(cfs, median) {
   if (cfs == null || isNaN(cfs)) return 'no-data'
   if (median == null) {
@@ -252,6 +253,23 @@ export function classifyFlow(cfs, median) {
   return 'very-high'
 }
 
+/**
+ * NEW: Classify current gauge height vs the gauge's own 7-day average.
+ * Uses absolute deviation in feet rather than ratio (more meaningful for height).
+ */
+export function classifyHeight(currentFt, sevenDayAvgFt) {
+  if (currentFt == null || isNaN(currentFt)) return 'no-data'
+  if (sevenDayAvgFt == null || isNaN(sevenDayAvgFt)) return 'normal'
+  const delta = currentFt - sevenDayAvgFt
+  // Thresholds chosen so small streams aren't perpetually alarmed.
+  // Tune here if results are too sensitive / not sensitive enough.
+  if (delta < -1.5) return 'very-low'
+  if (delta < -0.5) return 'low'
+  if (delta < 0.5) return 'normal'
+  if (delta < 2.0) return 'high'
+  return 'very-high'
+}
+
 export const FLOW_COLORS = {
   'no-data': '#94a3b8',
   'very-low': '#dc2626',
@@ -259,7 +277,6 @@ export const FLOW_COLORS = {
   'normal': '#16a34a',
   'high': '#0ea5e9',
   'very-high': '#7c3aed',
-  'height': '#06b6d4', // distinct teal for gauge-height-only gauges
 }
 
 export const FLOW_LABELS = {
@@ -269,7 +286,6 @@ export const FLOW_LABELS = {
   'normal': 'Normal',
   'high': 'Above normal',
   'very-high': 'High / flood',
-  'height': 'Height only (ft)',
 }
 
 function distKm(lat1, lon1, lat2, lon2) {
@@ -296,10 +312,6 @@ function regionalUpstreamVector(huc2) {
   return [vec[0] / mag, vec[1] / mag]
 }
 
-/**
- * Pull a combined candidate pool: gauges that report EITHER discharge or height.
- * Each candidate is tagged with which parameter it reports for downstream use.
- */
 async function getCombinedSitesInHUC(huc) {
   try {
     const [discharge, height] = await Promise.all([
@@ -312,7 +324,6 @@ async function getCombinedSitesInHUC(huc) {
       if (!dischargeSet.has(s.siteNo)) {
         merged.push({ ...s, reportsDischarge: false, reportsHeight: true })
       } else {
-        // already in merged set — mark that it also has height
         const existing = merged.find((m) => m.siteNo === s.siteNo)
         if (existing) existing.reportsHeight = true
       }
@@ -371,10 +382,6 @@ export async function selectUpstreamGauges(reference, n = 7) {
   return top
 }
 
-/**
- * NEW: Like selectUpstreamGauges but the candidate pool INCLUDES gauges that
- * report only height (no discharge). Used by the default startup view.
- */
 export async function selectUpstreamGaugesIncludingHeightOnly(reference, n = 7) {
   const huc8 = (reference.huc || '').slice(0, 8)
   const huc6 = huc8.slice(0, 6)
@@ -408,7 +415,6 @@ export async function selectUpstreamGaugesIncludingHeightOnly(reference, n = 7) 
       else score -= 10
     }
     if (c.huc && c.huc.startsWith(huc8)) score += 20
-    // Slight preference for discharge-reporting gauges
     if (c.reportsDischarge) score += 10
     const distPenalty = d * 0.5
     return { site: c, distKm: d, score: score - distPenalty }
@@ -471,7 +477,6 @@ export async function selectUpstreamFromLocation(lat, lon, n = 8) {
   const huc2 = (nearest.huc || '').slice(0, 2)
   const upstreamVec = regionalUpstreamVector(huc2)
 
-  // For "Use My Location" we deliberately DO NOT include height-only gauges
   const candidates = await selectUpstreamGauges(nearest, n * 4)
 
   const refDA = nearest.drainageArea

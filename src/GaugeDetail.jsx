@@ -1,29 +1,30 @@
-// ===== STREAM GAUGE MAP v1.0.5 =====
+// ===== STREAM GAUGE MAP v1.0.6 =====
 // File: src/GaugeDetail.jsx
-// Changes from v1.0.1:
-//   - Handles height-only gauges (source === 'height') by showing ft instead of cfs
-//   - Pulls gauge-height history for those gauges
+// Changes from v1.0.5:
+//   - Accepts a `mode` prop ('height' or 'flow') from parent
+//   - In height mode: shows feet, 7-day height chart, height-vs-7-day-avg classification
+//   - In flow mode: original CFS behavior with median comparison
 
 import { useEffect, useState } from 'react'
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine } from 'recharts'
 import { get7DayHistory, get7DayHistoryHeight, FLOW_COLORS, FLOW_LABELS } from './usgs'
 
-export default function GaugeDetail({ gauge, reading, median, classification, onClose }) {
+export default function GaugeDetail({ gauge, reading, median, classification, mode, onClose }) {
   const [history, setHistory] = useState(null)
   const [historyError, setHistoryError] = useState(null)
 
-  const isHeightOnly = reading?.source === 'height'
-  const unit = isHeightOnly ? 'ft' : 'cfs'
-  const value = isHeightOnly ? reading?.feet : reading?.cfs
-  const dataKey = isHeightOnly ? 'feet' : 'cfs'
-  const markerColor = isHeightOnly ? FLOW_COLORS['height'] : FLOW_COLORS[classification]
-  const classLabel = isHeightOnly ? FLOW_LABELS['height'] : FLOW_LABELS[classification]
+  const isHeight = mode === 'height' || reading?.source === 'height'
+  const unit = isHeight ? 'ft' : 'cfs'
+  const value = isHeight ? reading?.feet : reading?.cfs
+  const dataKey = isHeight ? 'feet' : 'cfs'
+  const markerColor = FLOW_COLORS[classification] || FLOW_COLORS['no-data']
+  const classLabel = FLOW_LABELS[classification] || 'No data'
 
   useEffect(() => {
     let cancelled = false
     setHistory(null)
     setHistoryError(null)
-    const fetcher = isHeightOnly ? get7DayHistoryHeight : get7DayHistory
+    const fetcher = isHeight ? get7DayHistoryHeight : get7DayHistory
     fetcher(gauge.siteNo)
       .then((data) => {
         if (cancelled) return
@@ -35,7 +36,7 @@ export default function GaugeDetail({ gauge, reading, median, classification, on
         if (!cancelled) setHistoryError(e.message || 'History fetch failed')
       })
     return () => { cancelled = true }
-  }, [gauge.siteNo, isHeightOnly])
+  }, [gauge.siteNo, isHeight])
 
   const trendIcon =
     reading?.source === 'dv' ? '◷' :
@@ -68,7 +69,7 @@ export default function GaugeDetail({ gauge, reading, median, classification, on
       <div className="detail-body">
         <div className="metric-grid">
           <div className="metric" style={{ borderColor: markerColor }}>
-            <div className="label">{isHeightOnly ? 'Gauge height' : 'Discharge'}</div>
+            <div className="label">{isHeight ? 'Gauge height' : 'Discharge'}</div>
             <div className="value">
               {value != null ? (value >= 100 ? Math.round(value).toLocaleString() : value.toFixed(1)) : '—'}{' '}
               <span style={{ fontSize: 12, fontWeight: 500, color: '#64748b' }}>{unit}</span>
@@ -90,7 +91,18 @@ export default function GaugeDetail({ gauge, reading, median, classification, on
             )}
           </div>
 
-          {!isHeightOnly && median != null && (
+          {isHeight && reading?.sevenDayAvg != null && (
+            <div className="metric">
+              <div className="label">7-day avg height</div>
+              <div className="value">
+                {reading.sevenDayAvg.toFixed(1)}
+                <span style={{ fontSize: 12, fontWeight: 500, color: '#64748b' }}> ft</span>
+              </div>
+              <div className="sub">For classification</div>
+            </div>
+          )}
+
+          {!isHeight && median != null && (
             <div className="metric">
               <div className="label">Today's median</div>
               <div className="value">
@@ -147,13 +159,19 @@ export default function GaugeDetail({ gauge, reading, median, classification, on
                   })
                 }
                 formatter={(v) => [
-                  isHeightOnly
-                    ? `${v.toFixed(2)} ft`
-                    : `${Math.round(v).toLocaleString()} cfs`,
-                  isHeightOnly ? 'Gauge height' : 'Discharge',
+                  isHeight ? `${v.toFixed(2)} ft` : `${Math.round(v).toLocaleString()} cfs`,
+                  isHeight ? 'Gauge height' : 'Discharge',
                 ]}
               />
-              {!isHeightOnly && median != null && (
+              {isHeight && reading?.sevenDayAvg != null && (
+                <ReferenceLine
+                  y={reading.sevenDayAvg}
+                  stroke="#94a3b8"
+                  strokeDasharray="4 4"
+                  label={{ value: '7-day avg', fontSize: 10, fill: '#64748b', position: 'right' }}
+                />
+              )}
+              {!isHeight && median != null && (
                 <ReferenceLine
                   y={median}
                   stroke="#94a3b8"
