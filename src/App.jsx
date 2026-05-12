@@ -1,17 +1,18 @@
-// ===== STREAM GAUGE MAP v1.0.2 =====
+// ===== STREAM GAUGE MAP v1.0.3 =====
 // File: src/App.jsx
-// Changes from v1.0.1:
-//   - EXCLUDED_SITES: blacklist of gauge IDs to never show on startup
-//   - Default exclusions: Hominy Creek, Flat Rock, Coal Creek
-//   - "Use My Location" now filters out gauges downstream of the user
-// If you can see this comment in GitHub after pasting, the paste worked.
+// Changes from v1.0.2:
+//   - When a gauge has no recent instantaneous-values (IV) reading, fall back to
+//     its most recent daily-values (DV) reading so the marker shows something
+//     instead of a dash. DV-derived readings display with a clock icon to flag
+//     that they may be up to a day old.
+//   - "Use My Location" now uses geographic upstream filter (see usgs.js)
 
 import { useEffect, useState, useCallback, useMemo } from 'react'
 import { MapContainer, TileLayer, Marker, useMap } from 'react-leaflet'
 import L from 'leaflet'
 import {
-  getSitesInHUC,
   getCurrentReadings,
+  getDailyValueFallback,
   selectUpstreamGauges,
   selectUpstreamFromLocation,
   classifyFlow,
@@ -21,7 +22,6 @@ import {
 } from './usgs'
 import GaugeDetail from './GaugeDetail'
 
-// Default starting gauge: USGS 07176500 Bird Creek at Avant, OK
 const DEFAULT_START = {
   siteNo: '07176500',
   name: 'Bird Creek at Avant, OK',
@@ -32,8 +32,6 @@ const DEFAULT_START = {
   altitude: 646.39,
 }
 
-// Gauges to never show on the map, even if the algorithm picks them.
-// Add or remove site numbers here to customize.
 const EXCLUDED_SITES = new Set([
   '07176950', // Hominy Creek
   '07177650', // Flat Rock
@@ -52,19 +50,18 @@ function buildMarkerIcon(reading, classification) {
       : reading.cfs >= 10
       ? Math.round(reading.cfs).toString()
       : reading.cfs.toFixed(1)
-  const arrow =
-    reading?.trend === 'rising' ? '▲' : reading?.trend === 'falling' ? '▼' : '●'
-  const arrowColor =
-    reading?.trend === 'rising'
-      ? '#fff'
-      : reading?.trend === 'falling'
-      ? '#fff'
-      : '#fff'
+  let arrow
+  if (reading?.source === 'dv') {
+    arrow = '◷' // clock-like glyph for "daily value, may be stale"
+  } else {
+    arrow =
+      reading?.trend === 'rising' ? '▲' : reading?.trend === 'falling' ? '▼' : '●'
+  }
 
   const html = `
     <div class="pin" style="background:${color}">
       <div class="cfs">${cfsText}</div>
-      <div class="arrow" style="color:${arrowColor}">${arrow}</div>
+      <div class="arrow" style="color:#fff">${arrow}</div>
     </div>
     <div class="label">cfs</div>
   `
@@ -85,7 +82,6 @@ function userLocationIcon() {
   })
 }
 
-/** Imperatively fits the map to the gauge bounds whenever the list changes. */
 function FitToBounds({ gauges, userLoc }) {
   const map = useMap()
   useEffect(() => {
@@ -96,6 +92,21 @@ function FitToBounds({ gauges, userLoc }) {
     map.fitBounds(bounds, { padding: [50, 50], maxZoom: 11 })
   }, [gauges, userLoc, map])
   return null
+}
+
+/**
+ * For any gauge missing a current IV reading, fetch its daily value as a fallback.
+ * Returns merged readings object.
+ */
+async function applyDVFallback(siteNos, ivReadings) {
+  const missing = siteNos.filter((s) => !ivReadings[s])
+  if (missing.length === 0) return ivReadings
+  const dvResults = await Promise.all(missing.map((s) => getDailyValueFallback(s)))
+  const merged = { ...ivReadings }
+  missing.forEach((siteNo, i) => {
+    if (dvResults[i]) merged[siteNo] = dvResults[i]
+  })
+  return merged
 }
 
 export default function App() {
@@ -113,14 +124,14 @@ export default function App() {
     setError(null)
     setStatus(label || 'Finding upstream gauges...')
     try {
-      // Ask for more than we need so we have replacements after filtering
       const upstream = await selectUpstreamGauges(referenceGauge, NUM_GAUGES + EXCLUDED_SITES.size)
-      // Remove excluded sites
       const filtered = upstream.filter((g) => !EXCLUDED_SITES.has(g.siteNo))
       const all = [referenceGauge, ...filtered].slice(0, NUM_GAUGES)
       setGauges(all)
       setStatus(`Loading current flows for ${all.length} gauges...`)
-      const r = await getCurrentReadings(all.map((g) => g.siteNo))
+      const siteNos = all.map((g) => g.siteNo)
+      let r = await getCurrentReadings(siteNos)
+      r = await applyDVFallback(siteNos, r)
       setReadings(r)
       setStatus(null)
       setLoading(false)
@@ -139,7 +150,6 @@ export default function App() {
     }
   }, [])
 
-  // Initial load: default starting gauge
   useEffect(() => {
     loadGaugesFor(DEFAULT_START, 'Loading Bird Creek and upstream gauges...')
   }, [loadGaugesFor])
@@ -157,17 +167,17 @@ export default function App() {
         setUserLoc({ lat: latitude, lon: longitude })
         try {
           setStatus('Finding gauges upstream of you...')
-          // Ask for extras so filtering doesn't leave us short
           const list = await selectUpstreamFromLocation(
             latitude,
             longitude,
             NUM_GAUGES + EXCLUDED_SITES.size
           )
-          // Also apply the exclusion list here
           const filtered = list.filter((g) => !EXCLUDED_SITES.has(g.siteNo)).slice(0, NUM_GAUGES)
           setGauges(filtered)
           setStatus(`Loading current flows for ${filtered.length} gauges...`)
-          const r = await getCurrentReadings(filtered.map((g) => g.siteNo))
+          const siteNos = filtered.map((g) => g.siteNo)
+          let r = await getCurrentReadings(siteNos)
+          r = await applyDVFallback(siteNos, r)
           setReadings(r)
           setStatus(null)
           setLoading(false)
@@ -210,7 +220,7 @@ export default function App() {
     <div className="app">
       <div className="header">
         <div>
-          <h1>🌊 Stream Gauge Map <span style={{fontSize:10,opacity:0.6}}>v1.0.2</span></h1>
+          <h1>🌊 Stream Gauge Map <span style={{fontSize:10,opacity:0.6}}>v1.0.3</span></h1>
           <div className="sub">
             {gauges.length > 0
               ? `${gauges.length} gauges · ${gauges[0]?.name?.split(',')[0] || ''}`
@@ -274,7 +284,7 @@ export default function App() {
             </div>
           ))}
           <div style={{ marginTop: 6, fontSize: 10, color: '#64748b' }}>
-            ▲ rising · ▼ falling · ● steady
+            ▲ rising · ▼ falling · ● steady · ◷ daily value
           </div>
         </div>
 
