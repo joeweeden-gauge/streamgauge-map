@@ -1,302 +1,192 @@
-// ===== STREAM GAUGE MAP v1.0.3 =====
-// File: src/App.jsx
-// Changes from v1.0.2:
-//   - When a gauge has no recent instantaneous-values (IV) reading, fall back to
-//     its most recent daily-values (DV) reading so the marker shows something
-//     instead of a dash. DV-derived readings display with a clock icon to flag
-//     that they may be up to a day old.
-//   - "Use My Location" now uses geographic upstream filter (see usgs.js)
+// ===== STREAM GAUGE MAP v1.0.5 =====
+// File: src/GaugeDetail.jsx
+// Changes from v1.0.1:
+//   - Handles height-only gauges (source === 'height') by showing ft instead of cfs
+//   - Pulls gauge-height history for those gauges
 
-import { useEffect, useState, useCallback, useMemo } from 'react'
-import { MapContainer, TileLayer, Marker, useMap } from 'react-leaflet'
-import L from 'leaflet'
-import {
-  getCurrentReadings,
-  getDailyValueFallback,
-  selectUpstreamGauges,
-  selectUpstreamFromLocation,
-  classifyFlow,
-  getMedianFlow,
-  FLOW_COLORS,
-  FLOW_LABELS,
-} from './usgs'
-import GaugeDetail from './GaugeDetail'
+import { useEffect, useState } from 'react'
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine } from 'recharts'
+import { get7DayHistory, get7DayHistoryHeight, FLOW_COLORS, FLOW_LABELS } from './usgs'
 
-const DEFAULT_START = {
-  siteNo: '07176500',
-  name: 'Bird Creek at Avant, OK',
-  lat: 36.4850,
-  lon: -96.0603,
-  huc: '11070107',
-  drainageArea: 369,
-  altitude: 646.39,
-}
+export default function GaugeDetail({ gauge, reading, median, classification, onClose }) {
+  const [history, setHistory] = useState(null)
+  const [historyError, setHistoryError] = useState(null)
 
-const EXCLUDED_SITES = new Set([
-  '07176950', // Hominy Creek
-  '07177650', // Flat Rock
-  '07177800', // Coal Creek
-])
-
-const NUM_GAUGES = 8
-
-function buildMarkerIcon(reading, classification) {
-  const color = FLOW_COLORS[classification]
-  const cfsText =
-    reading?.cfs == null
-      ? '—'
-      : reading.cfs >= 1000
-      ? `${(reading.cfs / 1000).toFixed(1)}k`
-      : reading.cfs >= 10
-      ? Math.round(reading.cfs).toString()
-      : reading.cfs.toFixed(1)
-  let arrow
-  if (reading?.source === 'dv') {
-    arrow = '◷' // clock-like glyph for "daily value, may be stale"
-  } else {
-    arrow =
-      reading?.trend === 'rising' ? '▲' : reading?.trend === 'falling' ? '▼' : '●'
-  }
-
-  const html = `
-    <div class="pin" style="background:${color}">
-      <div class="cfs">${cfsText}</div>
-      <div class="arrow" style="color:#fff">${arrow}</div>
-    </div>
-    <div class="label">cfs</div>
-  `
-  return L.divIcon({
-    className: 'gauge-marker',
-    html,
-    iconSize: [56, 56],
-    iconAnchor: [28, 28],
-  })
-}
-
-function userLocationIcon() {
-  return L.divIcon({
-    className: '',
-    html: '<div class="user-marker"></div>',
-    iconSize: [20, 20],
-    iconAnchor: [10, 10],
-  })
-}
-
-function FitToBounds({ gauges, userLoc }) {
-  const map = useMap()
-  useEffect(() => {
-    if (gauges.length === 0) return
-    const points = gauges.map((g) => [g.lat, g.lon])
-    if (userLoc) points.push([userLoc.lat, userLoc.lon])
-    const bounds = L.latLngBounds(points)
-    map.fitBounds(bounds, { padding: [50, 50], maxZoom: 11 })
-  }, [gauges, userLoc, map])
-  return null
-}
-
-/**
- * For any gauge missing a current IV reading, fetch its daily value as a fallback.
- * Returns merged readings object.
- */
-async function applyDVFallback(siteNos, ivReadings) {
-  const missing = siteNos.filter((s) => !ivReadings[s])
-  if (missing.length === 0) return ivReadings
-  const dvResults = await Promise.all(missing.map((s) => getDailyValueFallback(s)))
-  const merged = { ...ivReadings }
-  missing.forEach((siteNo, i) => {
-    if (dvResults[i]) merged[siteNo] = dvResults[i]
-  })
-  return merged
-}
-
-export default function App() {
-  const [gauges, setGauges] = useState([])
-  const [readings, setReadings] = useState({})
-  const [medians, setMedians] = useState({})
-  const [selected, setSelected] = useState(null)
-  const [status, setStatus] = useState('Loading default gauges...')
-  const [error, setError] = useState(null)
-  const [userLoc, setUserLoc] = useState(null)
-  const [loading, setLoading] = useState(true)
-
-  const loadGaugesFor = useCallback(async (referenceGauge, label) => {
-    setLoading(true)
-    setError(null)
-    setStatus(label || 'Finding upstream gauges...')
-    try {
-      const upstream = await selectUpstreamGauges(referenceGauge, NUM_GAUGES + EXCLUDED_SITES.size)
-      const filtered = upstream.filter((g) => !EXCLUDED_SITES.has(g.siteNo))
-      const all = [referenceGauge, ...filtered].slice(0, NUM_GAUGES)
-      setGauges(all)
-      setStatus(`Loading current flows for ${all.length} gauges...`)
-      const siteNos = all.map((g) => g.siteNo)
-      let r = await getCurrentReadings(siteNos)
-      r = await applyDVFallback(siteNos, r)
-      setReadings(r)
-      setStatus(null)
-      setLoading(false)
-      const meds = {}
-      await Promise.all(
-        all.map(async (g) => {
-          const m = await getMedianFlow(g.siteNo)
-          if (m != null) meds[g.siteNo] = m
-        })
-      )
-      setMedians(meds)
-    } catch (e) {
-      console.error(e)
-      setError(e.message || 'Failed to load gauges')
-      setLoading(false)
-    }
-  }, [])
+  const isHeightOnly = reading?.source === 'height'
+  const unit = isHeightOnly ? 'ft' : 'cfs'
+  const value = isHeightOnly ? reading?.feet : reading?.cfs
+  const dataKey = isHeightOnly ? 'feet' : 'cfs'
+  const markerColor = isHeightOnly ? FLOW_COLORS['height'] : FLOW_COLORS[classification]
+  const classLabel = isHeightOnly ? FLOW_LABELS['height'] : FLOW_LABELS[classification]
 
   useEffect(() => {
-    loadGaugesFor(DEFAULT_START, 'Loading Bird Creek and upstream gauges...')
-  }, [loadGaugesFor])
+    let cancelled = false
+    setHistory(null)
+    setHistoryError(null)
+    const fetcher = isHeightOnly ? get7DayHistoryHeight : get7DayHistory
+    fetcher(gauge.siteNo)
+      .then((data) => {
+        if (cancelled) return
+        const step = Math.max(1, Math.floor(data.length / 150))
+        const sampled = data.filter((_, i) => i % step === 0 || i === data.length - 1)
+        setHistory(sampled)
+      })
+      .catch((e) => {
+        if (!cancelled) setHistoryError(e.message || 'History fetch failed')
+      })
+    return () => { cancelled = true }
+  }, [gauge.siteNo, isHeightOnly])
 
-  const handleUseMyLocation = useCallback(() => {
-    if (!navigator.geolocation) {
-      setError('Geolocation is not supported by your browser.')
-      return
-    }
-    setStatus('Getting your location...')
-    setLoading(true)
-    navigator.geolocation.getCurrentPosition(
-      async (pos) => {
-        const { latitude, longitude } = pos.coords
-        setUserLoc({ lat: latitude, lon: longitude })
-        try {
-          setStatus('Finding gauges upstream of you...')
-          const list = await selectUpstreamFromLocation(
-            latitude,
-            longitude,
-            NUM_GAUGES + EXCLUDED_SITES.size
-          )
-          const filtered = list.filter((g) => !EXCLUDED_SITES.has(g.siteNo)).slice(0, NUM_GAUGES)
-          setGauges(filtered)
-          setStatus(`Loading current flows for ${filtered.length} gauges...`)
-          const siteNos = filtered.map((g) => g.siteNo)
-          let r = await getCurrentReadings(siteNos)
-          r = await applyDVFallback(siteNos, r)
-          setReadings(r)
-          setStatus(null)
-          setLoading(false)
-          const meds = {}
-          await Promise.all(
-            filtered.map(async (g) => {
-              const m = await getMedianFlow(g.siteNo)
-              if (m != null) meds[g.siteNo] = m
-            })
-          )
-          setMedians(meds)
-        } catch (e) {
-          setError(e.message || 'Failed to find upstream gauges from your location.')
-          setLoading(false)
-        }
-      },
-      (err) => {
-        setError(`Location error: ${err.message}`)
-        setLoading(false)
-      },
-      { enableHighAccuracy: true, timeout: 15000 }
-    )
-  }, [])
+  const trendIcon =
+    reading?.source === 'dv' ? '◷' :
+    reading?.trend === 'rising' ? '▲' :
+    reading?.trend === 'falling' ? '▼' : '●'
+  const trendClass =
+    reading?.trend === 'rising' ? 'trend-up' :
+    reading?.trend === 'falling' ? 'trend-down' : 'trend-flat'
+  const trendLabel =
+    reading?.source === 'dv' ? 'Daily value' :
+    reading?.trend === 'rising' ? 'Rising' :
+    reading?.trend === 'falling' ? 'Falling' : 'Steady'
 
-  const handleResetDefault = useCallback(() => {
-    setUserLoc(null)
-    loadGaugesFor(DEFAULT_START, 'Loading Bird Creek and upstream gauges...')
-  }, [loadGaugesFor])
-
-  const markers = useMemo(() => {
-    return gauges.map((g) => {
-      const reading = readings[g.siteNo]
-      const median = medians[g.siteNo]
-      const classification = classifyFlow(reading?.cfs, median)
-      return { gauge: g, reading, median, classification }
-    })
-  }, [gauges, readings, medians])
+  const lastUpdated = reading?.time
+    ? new Date(reading.time).toLocaleString(undefined, {
+        month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
+      })
+    : '—'
 
   return (
-    <div className="app">
-      <div className="header">
-        <div>
-          <h1>🌊 Stream Gauge Map <span style={{fontSize:10,opacity:0.6}}>v1.0.3</span></h1>
-          <div className="sub">
-            {gauges.length > 0
-              ? `${gauges.length} gauges · ${gauges[0]?.name?.split(',')[0] || ''}`
-              : 'Loading...'}
-          </div>
+    <div className="detail">
+      <div className="detail-header">
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <h2>{gauge.name}</h2>
+          <div className="id">USGS {gauge.siteNo}</div>
         </div>
-        <div style={{ display: 'flex', gap: 8 }}>
-          <button className="btn secondary" onClick={handleResetDefault} disabled={loading}>
-            Reset
-          </button>
-          <button className="btn" onClick={handleUseMyLocation} disabled={loading}>
-            📍 Use My Location
-          </button>
-        </div>
+        <button className="detail-close" onClick={onClose} aria-label="Close">×</button>
       </div>
 
-      <div className="map-wrap">
-        <MapContainer
-          center={[DEFAULT_START.lat, DEFAULT_START.lon]}
-          zoom={9}
-          scrollWheelZoom
-          style={{ height: '100%', width: '100%' }}
-        >
-          <TileLayer
-            attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
-            url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-          />
-          <FitToBounds gauges={gauges} userLoc={userLoc} />
-          {markers.map(({ gauge, reading, classification }) => (
-            <Marker
-              key={gauge.siteNo}
-              position={[gauge.lat, gauge.lon]}
-              icon={buildMarkerIcon(reading, classification)}
-              eventHandlers={{
-                click: () => setSelected({ gauge, reading, median: medians[gauge.siteNo], classification }),
-              }}
-            />
-          ))}
-          {userLoc && (
-            <Marker
-              position={[userLoc.lat, userLoc.lon]}
-              icon={userLocationIcon()}
-              interactive={false}
-            />
-          )}
-        </MapContainer>
-
-        {status && <div className="status">{status}</div>}
-        {error && (
-          <div className="status error" onClick={() => setError(null)}>
-            ⚠️ {error} (tap to dismiss)
-          </div>
-        )}
-
-        <div className="legend">
-          <div style={{ fontWeight: 600, marginBottom: 4 }}>Flow vs. typical</div>
-          {['very-low', 'low', 'normal', 'high', 'very-high'].map((k) => (
-            <div className="row" key={k}>
-              <div className="swatch" style={{ background: FLOW_COLORS[k] }} />
-              <span>{FLOW_LABELS[k]}</span>
+      <div className="detail-body">
+        <div className="metric-grid">
+          <div className="metric" style={{ borderColor: markerColor }}>
+            <div className="label">{isHeightOnly ? 'Gauge height' : 'Discharge'}</div>
+            <div className="value">
+              {value != null ? (value >= 100 ? Math.round(value).toLocaleString() : value.toFixed(1)) : '—'}{' '}
+              <span style={{ fontSize: 12, fontWeight: 500, color: '#64748b' }}>{unit}</span>
             </div>
-          ))}
-          <div style={{ marginTop: 6, fontSize: 10, color: '#64748b' }}>
-            ▲ rising · ▼ falling · ● steady · ◷ daily value
+            <div className="sub" style={{ color: markerColor, fontWeight: 600 }}>
+              {classLabel}
+            </div>
           </div>
+
+          <div className="metric">
+            <div className="label">Trend (3 hr)</div>
+            <div className={`value ${trendClass}`}>
+              {trendIcon} {trendLabel}
+            </div>
+            {reading?.delta != null && (
+              <div className="sub">
+                {reading.delta > 0 ? '+' : ''}{reading.delta.toFixed(1)} {unit}
+              </div>
+            )}
+          </div>
+
+          {!isHeightOnly && median != null && (
+            <div className="metric">
+              <div className="label">Today's median</div>
+              <div className="value">
+                {median >= 100 ? Math.round(median).toLocaleString() : median.toFixed(1)}
+                <span style={{ fontSize: 12, fontWeight: 500, color: '#64748b' }}> cfs</span>
+              </div>
+              <div className="sub">Long-term average</div>
+            </div>
+          )}
+
+          {gauge.drainageArea != null && (
+            <div className="metric">
+              <div className="label">Drainage area</div>
+              <div className="value">
+                {gauge.drainageArea.toLocaleString()}
+                <span style={{ fontSize: 12, fontWeight: 500, color: '#64748b' }}> mi²</span>
+              </div>
+            </div>
+          )}
         </div>
 
-        {selected && (
-          <GaugeDetail
-            gauge={selected.gauge}
-            reading={selected.reading}
-            median={selected.median}
-            classification={selected.classification}
-            onClose={() => setSelected(null)}
-          />
+        <div className="chart-title">Last 7 days</div>
+        {history === null && !historyError && (
+          <div style={{ height: 200, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#94a3b8' }}>
+            Loading chart...
+          </div>
         )}
+        {historyError && (
+          <div style={{ color: '#dc2626', fontSize: 12 }}>{historyError}</div>
+        )}
+        {history && history.length > 0 && (
+          <ResponsiveContainer width="100%" height={200}>
+            <LineChart data={history} margin={{ top: 5, right: 10, left: -10, bottom: 5 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+              <XAxis
+                dataKey="time"
+                tickFormatter={(t) => {
+                  const d = new Date(t)
+                  return `${d.getMonth() + 1}/${d.getDate()}`
+                }}
+                tick={{ fontSize: 10 }}
+                interval="preserveStartEnd"
+                minTickGap={40}
+              />
+              <YAxis
+                tick={{ fontSize: 10 }}
+                width={50}
+                tickFormatter={(v) => (v >= 1000 ? `${(v / 1000).toFixed(1)}k` : v)}
+              />
+              <Tooltip
+                labelFormatter={(t) =>
+                  new Date(t).toLocaleString(undefined, {
+                    month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
+                  })
+                }
+                formatter={(v) => [
+                  isHeightOnly
+                    ? `${v.toFixed(2)} ft`
+                    : `${Math.round(v).toLocaleString()} cfs`,
+                  isHeightOnly ? 'Gauge height' : 'Discharge',
+                ]}
+              />
+              {!isHeightOnly && median != null && (
+                <ReferenceLine
+                  y={median}
+                  stroke="#94a3b8"
+                  strokeDasharray="4 4"
+                  label={{ value: 'Median', fontSize: 10, fill: '#64748b', position: 'right' }}
+                />
+              )}
+              <Line
+                type="monotone"
+                dataKey={dataKey}
+                stroke={markerColor}
+                strokeWidth={2}
+                dot={false}
+              />
+            </LineChart>
+          </ResponsiveContainer>
+        )}
+        {history && history.length === 0 && !historyError && (
+          <div style={{ color: '#94a3b8', fontSize: 12 }}>No 7-day data available.</div>
+        )}
+
+        <div style={{ marginTop: 10, fontSize: 11, color: '#64748b' }}>
+          Last reading: {lastUpdated}
+        </div>
+
+        <a
+          className="usgs-link"
+          href={`https://waterdata.usgs.gov/monitoring-location/${gauge.siteNo}/`}
+          target="_blank"
+          rel="noopener noreferrer"
+        >
+          View full data on USGS →
+        </a>
       </div>
     </div>
   )

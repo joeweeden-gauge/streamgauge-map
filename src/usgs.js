@@ -1,10 +1,10 @@
-// ===== STREAM GAUGE MAP v1.0.3 =====
+// ===== STREAM GAUGE MAP v1.0.5 =====
 // File: src/usgs.js
-// Changes from v1.0.2:
-//   - getDailyValueFallback: pulls most recent DV when IV data is unavailable
-//   - selectUpstreamFromLocation: hybrid filter (drainage area + regional flow
-//     direction) so gauges south/downstream of the user are excluded
-//   - Flow direction is approximated per HUC-2 (major US watershed region)
+// Changes from v1.0.4:
+//   - iPhone 400 fix: bbox coords rounded to 4 decimals, progressive sizing
+//   - NEW: getGaugeHeightFallback() - pulls gage height (ft) when discharge unavailable
+//   - NEW: selectUpstreamGaugesIncludingHeightOnly() - finds gauges that report
+//     EITHER discharge OR gauge height, used by the default startup view only
 
 const SITE_BASE = 'https://waterservices.usgs.gov/nwis/site/'
 const IV_BASE = 'https://waterservices.usgs.gov/nwis/iv/'
@@ -12,6 +12,7 @@ const DV_BASE = 'https://waterservices.usgs.gov/nwis/dv/'
 const STATS_BASE = 'https://waterservices.usgs.gov/nwis/stat/'
 
 const PARAM_DISCHARGE = '00060'
+const PARAM_GAUGE_HEIGHT = '00065'
 
 function parseRDB(text) {
   const lines = text.split('\n').filter((l) => l && !l.startsWith('#'))
@@ -27,8 +28,12 @@ function parseRDB(text) {
   })
 }
 
-export async function getSitesInHUC(huc) {
-  const url = `${SITE_BASE}?format=rdb&huc=${huc}&parameterCd=${PARAM_DISCHARGE}&siteType=ST&siteStatus=active&hasDataTypeCd=iv`
+/**
+ * Get all stream sites in a HUC that report a given parameter.
+ * paramCd defaults to discharge.
+ */
+export async function getSitesInHUC(huc, paramCd = PARAM_DISCHARGE) {
+  const url = `${SITE_BASE}?format=rdb&huc=${huc}&parameterCd=${paramCd}&siteType=ST&siteStatus=active&hasDataTypeCd=iv`
   const res = await fetch(url)
   if (!res.ok) throw new Error(`USGS site service: HTTP ${res.status}`)
   const text = await res.text()
@@ -87,18 +92,11 @@ export async function getCurrentReadings(siteNos) {
   return result
 }
 
-/**
- * Pull the most recent daily value for a site. Used as a fallback when the
- * gauge doesn't report instantaneous values. Returns null if no DV either.
- */
 export async function getDailyValueFallback(siteNo) {
   try {
-    // Pull last 30 days of daily values; pick the most recent non-null
     const end = new Date()
     const start = new Date(end.getTime() - 30 * 24 * 3600 * 1000)
-    const startStr = start.toISOString().slice(0, 10)
-    const endStr = end.toISOString().slice(0, 10)
-    const url = `${DV_BASE}?format=json&sites=${siteNo}&parameterCd=${PARAM_DISCHARGE}&startDT=${startStr}&endDT=${endStr}`
+    const url = `${DV_BASE}?format=json&sites=${siteNo}&parameterCd=${PARAM_DISCHARGE}&startDT=${start.toISOString().slice(0, 10)}&endDT=${end.toISOString().slice(0, 10)}`
     const res = await fetch(url)
     if (!res.ok) return null
     const data = await res.json()
@@ -108,33 +106,64 @@ export async function getDailyValueFallback(siteNo) {
       .map((v) => ({ t: v.dateTime, cfs: parseFloat(v.value) }))
       .filter((p) => !isNaN(p.cfs) && p.cfs > -999999)
     if (values.length === 0) return null
-    // Most recent reading
     const last = values[values.length - 1]
-    // Compute trend by comparing to ~3 days earlier if available
     let trend = 'flat'
     let delta = null
     if (values.length >= 2) {
-      const ref = values[Math.max(0, values.length - 4)] // ~3 days back
+      const ref = values[Math.max(0, values.length - 4)]
       delta = last.cfs - ref.cfs
       const threshold = Math.max(5, ref.cfs * 0.1)
       if (delta > threshold) trend = 'rising'
       else if (delta < -threshold) trend = 'falling'
     }
-    return {
-      cfs: last.cfs,
-      time: last.t,
-      trend,
-      delta,
-      source: 'dv', // flag so UI can show "daily value" indicator
-    }
+    return { cfs: last.cfs, time: last.t, trend, delta, source: 'dv' }
   } catch (e) {
     console.warn(`DV fallback failed for ${siteNo}:`, e)
     return null
   }
 }
 
+/**
+ * NEW: Pull current gauge height (in feet) for a site when discharge is unavailable.
+ * Returns reading with `feet` instead of `cfs` and `source: 'height'`.
+ */
+export async function getGaugeHeightFallback(siteNo) {
+  try {
+    const url = `${IV_BASE}?format=json&sites=${siteNo}&parameterCd=${PARAM_GAUGE_HEIGHT}&period=PT6H`
+    const res = await fetch(url)
+    if (!res.ok) return null
+    const data = await res.json()
+    const ts = data.value?.timeSeries?.[0]
+    if (!ts) return null
+    const values = (ts.values?.[0]?.value || [])
+      .map((v) => ({ t: new Date(v.dateTime).getTime(), v: parseFloat(v.value) }))
+      .filter((p) => !isNaN(p.v) && p.v > -999)
+    if (values.length === 0) return null
+    const last = values[values.length - 1]
+    const first = values[0]
+    const feet = last.v
+    const midpoint = values.find((p) => p.t >= last.t - 3 * 3600 * 1000)
+    const reference = midpoint || first
+    const delta = feet - reference.v
+    let trend = 'flat'
+    // For gauge height, use a 0.1 ft / 5% threshold
+    const threshold = Math.max(0.1, reference.v * 0.05)
+    if (delta > threshold) trend = 'rising'
+    else if (delta < -threshold) trend = 'falling'
+    return {
+      feet,
+      time: new Date(last.t).toISOString(),
+      trend,
+      delta,
+      source: 'height',
+    }
+  } catch (e) {
+    console.warn(`Height fallback failed for ${siteNo}:`, e)
+    return null
+  }
+}
+
 export async function get7DayHistory(siteNo) {
-  // Try IV first
   try {
     const url = `${IV_BASE}?format=json&sites=${siteNo}&parameterCd=${PARAM_DISCHARGE}&period=P7D`
     const res = await fetch(url)
@@ -149,7 +178,6 @@ export async function get7DayHistory(siteNo) {
       }
     }
   } catch {}
-  // Fallback to DV
   try {
     const end = new Date()
     const start = new Date(end.getTime() - 7 * 24 * 3600 * 1000)
@@ -162,6 +190,25 @@ export async function get7DayHistory(siteNo) {
     return (ts.values?.[0]?.value || [])
       .map((v) => ({ time: v.dateTime, cfs: parseFloat(v.value) }))
       .filter((p) => !isNaN(p.cfs) && p.cfs > -999999)
+  } catch {
+    return []
+  }
+}
+
+/**
+ * NEW: 7-day gauge height history (in feet) — used for height-only gauges.
+ */
+export async function get7DayHistoryHeight(siteNo) {
+  try {
+    const url = `${IV_BASE}?format=json&sites=${siteNo}&parameterCd=${PARAM_GAUGE_HEIGHT}&period=P7D`
+    const res = await fetch(url)
+    if (!res.ok) return []
+    const data = await res.json()
+    const ts = data.value?.timeSeries?.[0]
+    if (!ts) return []
+    return (ts.values?.[0]?.value || [])
+      .map((v) => ({ time: v.dateTime, feet: parseFloat(v.value) }))
+      .filter((p) => !isNaN(p.feet) && p.feet > -999)
   } catch {
     return []
   }
@@ -212,6 +259,7 @@ export const FLOW_COLORS = {
   'normal': '#16a34a',
   'high': '#0ea5e9',
   'very-high': '#7c3aed',
+  'height': '#06b6d4', // distinct teal for gauge-height-only gauges
 }
 
 export const FLOW_LABELS = {
@@ -221,6 +269,7 @@ export const FLOW_LABELS = {
   'normal': 'Normal',
   'high': 'Above normal',
   'very-high': 'High / flood',
+  'height': 'Height only (ft)',
 }
 
 function distKm(lat1, lon1, lat2, lon2) {
@@ -234,43 +283,45 @@ function distKm(lat1, lon1, lat2, lon2) {
   return R * 2 * Math.asin(Math.sqrt(a))
 }
 
-/**
- * Approximate "uphill" direction (the direction water flows FROM, i.e. toward
- * which upstream gauges lie) for each USGS major HUC-2 region. Returned as a
- * unit vector in (dLat, dLon) space.
- *
- * The vector points TOWARD upstream. A gauge is upstream of a point if the
- * vector from the point to the gauge has a positive dot product with this.
- *
- * These are coarse but useful — rivers in each region flow predominantly in
- * one general direction.
- */
 function regionalUpstreamVector(huc2) {
   const map = {
-    // Region: upstream is generally...
-    '01': [0.3, -1.0],   // New England — west
-    '02': [0.3, -1.0],   // Mid-Atlantic — west
-    '03': [1.0, 0.3],    // South Atlantic-Gulf — north
-    '04': [-0.7, 0.7],   // Great Lakes — varies; default SE drain (upstream NW)
-    '05': [0.7, 0.7],    // Ohio — NE (tributaries from N/NE)
-    '06': [1.0, 0.3],    // Tennessee — north
-    '07': [1.0, 0.3],    // Upper Mississippi — north
-    '08': [1.0, 0.3],    // Lower Mississippi — north
-    '09': [1.0, 0.3],    // Souris-Red-Rainy — north
-    '10': [0.5, -1.0],   // Missouri — west (drains east)
-    '11': [0.5, -1.0],   // Arkansas-White-Red — NW (Bird Creek region)
-    '12': [1.0, -0.3],   // Texas-Gulf — north/NW (San Antonio basin)
-    '13': [0.3, -1.0],   // Rio Grande — west/NW
-    '14': [1.0, -0.5],   // Upper Colorado — north
-    '15': [0.5, -1.0],   // Lower Colorado — NE
-    '16': [1.0, 0.0],    // Great Basin — varies, default north
-    '17': [0.5, 1.0],    // Pacific Northwest — east (drains W)
-    '18': [0.5, 1.0],    // California — east (Sierra)
+    '01': [0.3, -1.0], '02': [0.3, -1.0], '03': [1.0, 0.3], '04': [-0.7, 0.7],
+    '05': [0.7, 0.7], '06': [1.0, 0.3], '07': [1.0, 0.3], '08': [1.0, 0.3],
+    '09': [1.0, 0.3], '10': [0.5, -1.0], '11': [0.5, -1.0], '12': [1.0, -0.3],
+    '13': [0.3, -1.0], '14': [1.0, -0.5], '15': [0.5, -1.0], '16': [1.0, 0.0],
+    '17': [0.5, 1.0], '18': [0.5, 1.0],
   }
-  const vec = map[huc2] || [1.0, 0.0] // default: north
-  // Normalize
+  const vec = map[huc2] || [1.0, 0.0]
   const mag = Math.hypot(vec[0], vec[1])
   return [vec[0] / mag, vec[1] / mag]
+}
+
+/**
+ * Pull a combined candidate pool: gauges that report EITHER discharge or height.
+ * Each candidate is tagged with which parameter it reports for downstream use.
+ */
+async function getCombinedSitesInHUC(huc) {
+  try {
+    const [discharge, height] = await Promise.all([
+      getSitesInHUC(huc, PARAM_DISCHARGE).catch(() => []),
+      getSitesInHUC(huc, PARAM_GAUGE_HEIGHT).catch(() => []),
+    ])
+    const dischargeSet = new Set(discharge.map((s) => s.siteNo))
+    const merged = discharge.map((s) => ({ ...s, reportsDischarge: true }))
+    for (const s of height) {
+      if (!dischargeSet.has(s.siteNo)) {
+        merged.push({ ...s, reportsDischarge: false, reportsHeight: true })
+      } else {
+        // already in merged set — mark that it also has height
+        const existing = merged.find((m) => m.siteNo === s.siteNo)
+        if (existing) existing.reportsHeight = true
+      }
+    }
+    return merged
+  } catch (e) {
+    console.warn(`Combined HUC fetch failed for ${huc}:`, e)
+    return []
+  }
 }
 
 export async function selectUpstreamGauges(reference, n = 7) {
@@ -321,24 +372,68 @@ export async function selectUpstreamGauges(reference, n = 7) {
 }
 
 /**
- * Find gauges geographically upstream of a user location.
- *
- * Strategy (Option C — pragmatic hybrid):
- *  1. Find the nearest active gauge to seed a watershed search.
- *  2. Pull a generous pool of candidate upstream gauges using HUC + drainage area.
- *  3. Filter the pool with TWO geographic checks against the user's actual location:
- *     a) Drainage area smaller than the reference (true upstream in network).
- *     b) Direction: the gauge lies in the regional "upstream" direction
- *        from the user (e.g. north/NW in Texas-Gulf region).
- *  4. If too few survive, relax to "either condition" instead of "both."
+ * NEW: Like selectUpstreamGauges but the candidate pool INCLUDES gauges that
+ * report only height (no discharge). Used by the default startup view.
  */
-export async function selectUpstreamFromLocation(lat, lon, n = 8) {
-  const bbox = [lon - 1, lat - 1, lon + 1, lat + 1].join(',')
+export async function selectUpstreamGaugesIncludingHeightOnly(reference, n = 7) {
+  const huc8 = (reference.huc || '').slice(0, 8)
+  const huc6 = huc8.slice(0, 6)
+  const huc4 = huc8.slice(0, 4)
+
+  const tried = new Set()
+  let candidates = []
+
+  for (const huc of [huc8, huc6, huc4].filter((h) => h && h.length >= 4)) {
+    if (tried.has(huc)) continue
+    tried.add(huc)
+    const sites = await getCombinedSitesInHUC(huc)
+    const have = new Set(candidates.map((s) => s.siteNo))
+    for (const s of sites) if (!have.has(s.siteNo)) candidates.push(s)
+    if (candidates.length >= n * 4) break
+  }
+
+  candidates = candidates.filter((c) => c.siteNo !== reference.siteNo)
+
+  const refDA = reference.drainageArea
+  const refAlt = reference.altitude
+  const scored = candidates.map((c) => {
+    const d = distKm(reference.lat, reference.lon, c.lat, c.lon)
+    let score = 0
+    if (refDA && c.drainageArea) {
+      if (c.drainageArea < refDA) score += 50
+      else score -= 20
+    }
+    if (refAlt && c.altitude) {
+      if (c.altitude > refAlt) score += 30
+      else score -= 10
+    }
+    if (c.huc && c.huc.startsWith(huc8)) score += 20
+    // Slight preference for discharge-reporting gauges
+    if (c.reportsDischarge) score += 10
+    const distPenalty = d * 0.5
+    return { site: c, distKm: d, score: score - distPenalty }
+  })
+
+  scored.sort((a, b) => b.score - a.score)
+  const within = scored.filter((s) => s.distKm < 200)
+  return (within.length >= n ? within : scored).slice(0, n).map((s) => s.site)
+}
+
+async function fetchSitesInBBox(lat, lon, halfSize) {
+  const round = (x) => Math.round(x * 10000) / 10000
+  const west = round(lon - halfSize)
+  const south = round(lat - halfSize)
+  const east = round(lon + halfSize)
+  const north = round(lat + halfSize)
+  const bbox = `${west},${south},${east},${north}`
   const url = `${SITE_BASE}?format=rdb&bBox=${bbox}&parameterCd=${PARAM_DISCHARGE}&siteType=ST&siteStatus=active&hasDataTypeCd=iv&siteOutput=expanded`
   const res = await fetch(url)
-  if (!res.ok) throw new Error(`Site search failed: ${res.status}`)
+  if (!res.ok) {
+    const msg = await res.text().catch(() => '')
+    throw new Error(`USGS site search HTTP ${res.status}${msg ? ': ' + msg.slice(0, 100) : ''}`)
+  }
   const text = await res.text()
-  const sites = parseRDB(text)
+  return parseRDB(text)
     .filter((r) => r.dec_lat_va && r.dec_long_va)
     .map((r) => ({
       siteNo: r.site_no,
@@ -349,9 +444,25 @@ export async function selectUpstreamFromLocation(lat, lon, n = 8) {
       drainageArea: r.drain_area_va ? parseFloat(r.drain_area_va) : null,
       altitude: r.alt_va ? parseFloat(r.alt_va) : null,
     }))
+}
+
+export async function selectUpstreamFromLocation(lat, lon, n = 8) {
+  let sites = []
+  const bboxSizes = [0.5, 1.0, 2.0]
+  let lastError = null
+  for (const halfSize of bboxSizes) {
+    try {
+      sites = await fetchSitesInBBox(lat, lon, halfSize)
+      if (sites.length > 0) break
+    } catch (e) {
+      lastError = e
+      console.warn(`bbox ${halfSize}° failed:`, e.message)
+    }
+  }
 
   if (sites.length === 0) {
-    throw new Error('No stream gauges found within ~110 km of your location.')
+    if (lastError) throw new Error(`Could not search for gauges near you. ${lastError.message}`)
+    throw new Error('No stream gauges found within ~220 km of your location.')
   }
 
   sites.sort((a, b) => distKm(lat, lon, a.lat, a.lon) - distKm(lat, lon, b.lat, b.lon))
@@ -360,37 +471,28 @@ export async function selectUpstreamFromLocation(lat, lon, n = 8) {
   const huc2 = (nearest.huc || '').slice(0, 2)
   const upstreamVec = regionalUpstreamVector(huc2)
 
-  // Larger candidate pool so we have plenty to filter
+  // For "Use My Location" we deliberately DO NOT include height-only gauges
   const candidates = await selectUpstreamGauges(nearest, n * 4)
 
   const refDA = nearest.drainageArea
   const refAlt = nearest.altitude
 
-  // Score each candidate on two criteria measured from THE USER, not the nearest gauge
   function isInUpstreamDirection(g) {
-    // Vector from user to candidate gauge
     const dLat = g.lat - lat
     const dLon = g.lon - lon
     const mag = Math.hypot(dLat, dLon)
-    if (mag < 0.001) return true // essentially at user's location
-    // Dot product with upstream unit vector
+    if (mag < 0.001) return true
     const dot = (dLat / mag) * upstreamVec[0] + (dLon / mag) * upstreamVec[1]
-    // Positive dot product = in the upstream half-plane.
-    // Require dot > -0.2 (some tolerance to avoid being overly strict; ~100° cone)
     return dot > -0.2
   }
-
   function hasSmallerDrainage(g) {
     if (refDA != null && g.drainageArea != null) return g.drainageArea < refDA
     if (refAlt != null && g.altitude != null) return g.altitude > refAlt
-    return true // unknown — be permissive
+    return true
   }
 
-  // Strict: both checks must pass
   const strict = candidates.filter((g) => isInUpstreamDirection(g) && hasSmallerDrainage(g))
-
   let result = strict
-  // Relax to either condition if too few
   if (result.length < n) {
     const have = new Set(result.map((g) => g.siteNo))
     const relaxed = candidates.filter(
@@ -398,7 +500,6 @@ export async function selectUpstreamFromLocation(lat, lon, n = 8) {
     )
     result = [...result, ...relaxed]
   }
-  // Last resort: original candidates
   if (result.length < n) {
     const have = new Set(result.map((g) => g.siteNo))
     for (const g of candidates) {
@@ -408,6 +509,5 @@ export async function selectUpstreamFromLocation(lat, lon, n = 8) {
       }
     }
   }
-
   return result.slice(0, n)
 }

@@ -1,23 +1,32 @@
-// ===== STREAM GAUGE MAP v1.0.1 =====
+// ===== STREAM GAUGE MAP v1.0.5 =====
 // File: src/GaugeDetail.jsx
-// If you can see this comment in GitHub after pasting, the paste worked.
+// Changes from v1.0.1:
+//   - Handles height-only gauges (source === 'height') by showing ft instead of cfs
+//   - Pulls gauge-height history for those gauges
 
 import { useEffect, useState } from 'react'
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine } from 'recharts'
-import { get7DayHistory, FLOW_COLORS, FLOW_LABELS } from './usgs'
+import { get7DayHistory, get7DayHistoryHeight, FLOW_COLORS, FLOW_LABELS } from './usgs'
 
 export default function GaugeDetail({ gauge, reading, median, classification, onClose }) {
   const [history, setHistory] = useState(null)
   const [historyError, setHistoryError] = useState(null)
 
+  const isHeightOnly = reading?.source === 'height'
+  const unit = isHeightOnly ? 'ft' : 'cfs'
+  const value = isHeightOnly ? reading?.feet : reading?.cfs
+  const dataKey = isHeightOnly ? 'feet' : 'cfs'
+  const markerColor = isHeightOnly ? FLOW_COLORS['height'] : FLOW_COLORS[classification]
+  const classLabel = isHeightOnly ? FLOW_LABELS['height'] : FLOW_LABELS[classification]
+
   useEffect(() => {
     let cancelled = false
     setHistory(null)
     setHistoryError(null)
-    get7DayHistory(gauge.siteNo)
+    const fetcher = isHeightOnly ? get7DayHistoryHeight : get7DayHistory
+    fetcher(gauge.siteNo)
       .then((data) => {
         if (cancelled) return
-        // Downsample to ~150 points for smooth rendering
         const step = Math.max(1, Math.floor(data.length / 150))
         const sampled = data.filter((_, i) => i % step === 0 || i === data.length - 1)
         setHistory(sampled)
@@ -25,33 +34,24 @@ export default function GaugeDetail({ gauge, reading, median, classification, on
       .catch((e) => {
         if (!cancelled) setHistoryError(e.message || 'History fetch failed')
       })
-    return () => {
-      cancelled = true
-    }
-  }, [gauge.siteNo])
+    return () => { cancelled = true }
+  }, [gauge.siteNo, isHeightOnly])
 
-  const cfs = reading?.cfs
   const trendIcon =
-    reading?.trend === 'rising' ? '▲' : reading?.trend === 'falling' ? '▼' : '●'
+    reading?.source === 'dv' ? '◷' :
+    reading?.trend === 'rising' ? '▲' :
+    reading?.trend === 'falling' ? '▼' : '●'
   const trendClass =
-    reading?.trend === 'rising'
-      ? 'trend-up'
-      : reading?.trend === 'falling'
-      ? 'trend-down'
-      : 'trend-flat'
+    reading?.trend === 'rising' ? 'trend-up' :
+    reading?.trend === 'falling' ? 'trend-down' : 'trend-flat'
   const trendLabel =
-    reading?.trend === 'rising'
-      ? 'Rising'
-      : reading?.trend === 'falling'
-      ? 'Falling'
-      : 'Steady'
+    reading?.source === 'dv' ? 'Daily value' :
+    reading?.trend === 'rising' ? 'Rising' :
+    reading?.trend === 'falling' ? 'Falling' : 'Steady'
 
   const lastUpdated = reading?.time
     ? new Date(reading.time).toLocaleString(undefined, {
-        month: 'short',
-        day: 'numeric',
-        hour: 'numeric',
-        minute: '2-digit',
+        month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
       })
     : '—'
 
@@ -62,21 +62,19 @@ export default function GaugeDetail({ gauge, reading, median, classification, on
           <h2>{gauge.name}</h2>
           <div className="id">USGS {gauge.siteNo}</div>
         </div>
-        <button className="detail-close" onClick={onClose} aria-label="Close">
-          ×
-        </button>
+        <button className="detail-close" onClick={onClose} aria-label="Close">×</button>
       </div>
 
       <div className="detail-body">
         <div className="metric-grid">
-          <div className="metric" style={{ borderColor: FLOW_COLORS[classification] }}>
-            <div className="label">Discharge</div>
+          <div className="metric" style={{ borderColor: markerColor }}>
+            <div className="label">{isHeightOnly ? 'Gauge height' : 'Discharge'}</div>
             <div className="value">
-              {cfs != null ? (cfs >= 100 ? Math.round(cfs).toLocaleString() : cfs.toFixed(1)) : '—'}{' '}
-              <span style={{ fontSize: 12, fontWeight: 500, color: '#64748b' }}>cfs</span>
+              {value != null ? (value >= 100 ? Math.round(value).toLocaleString() : value.toFixed(1)) : '—'}{' '}
+              <span style={{ fontSize: 12, fontWeight: 500, color: '#64748b' }}>{unit}</span>
             </div>
-            <div className="sub" style={{ color: FLOW_COLORS[classification], fontWeight: 600 }}>
-              {FLOW_LABELS[classification]}
+            <div className="sub" style={{ color: markerColor, fontWeight: 600 }}>
+              {classLabel}
             </div>
           </div>
 
@@ -87,13 +85,12 @@ export default function GaugeDetail({ gauge, reading, median, classification, on
             </div>
             {reading?.delta != null && (
               <div className="sub">
-                {reading.delta > 0 ? '+' : ''}
-                {reading.delta.toFixed(1)} cfs
+                {reading.delta > 0 ? '+' : ''}{reading.delta.toFixed(1)} {unit}
               </div>
             )}
           </div>
 
-          {median != null && (
+          {!isHeightOnly && median != null && (
             <div className="metric">
               <div className="label">Today's median</div>
               <div className="value">
@@ -146,15 +143,17 @@ export default function GaugeDetail({ gauge, reading, median, classification, on
               <Tooltip
                 labelFormatter={(t) =>
                   new Date(t).toLocaleString(undefined, {
-                    month: 'short',
-                    day: 'numeric',
-                    hour: 'numeric',
-                    minute: '2-digit',
+                    month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
                   })
                 }
-                formatter={(v) => [`${Math.round(v).toLocaleString()} cfs`, 'Discharge']}
+                formatter={(v) => [
+                  isHeightOnly
+                    ? `${v.toFixed(2)} ft`
+                    : `${Math.round(v).toLocaleString()} cfs`,
+                  isHeightOnly ? 'Gauge height' : 'Discharge',
+                ]}
               />
-              {median != null && (
+              {!isHeightOnly && median != null && (
                 <ReferenceLine
                   y={median}
                   stroke="#94a3b8"
@@ -164,8 +163,8 @@ export default function GaugeDetail({ gauge, reading, median, classification, on
               )}
               <Line
                 type="monotone"
-                dataKey="cfs"
-                stroke={FLOW_COLORS[classification]}
+                dataKey={dataKey}
+                stroke={markerColor}
                 strokeWidth={2}
                 dot={false}
               />
