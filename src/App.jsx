@@ -1,10 +1,9 @@
-// ===== STREAM GAUGE MAP v1.0.6 =====
+// ===== STREAM GAUGE MAP v1.0.8 =====
 // File: src/App.jsx
-// Changes from v1.0.5:
-//   - STARTUP VIEW: every gauge now shows feet (height), regardless of whether
-//     it reports discharge. Colors are based on current height vs the gauge's
-//     own 7-day average (red = unusually low, green = normal, purple = high).
-//   - "Use My Location" stays as CFS-only, unchanged.
+// Changes from v1.0.7:
+//   - NEW: precipitation panel at top-right showing 24h/72h/7-day rain totals
+//     for Skiatook area (36.50344, -96.10692). Loads on startup, hides during
+//     "Use My Location" mode.
 
 import { useEffect, useState, useCallback, useMemo } from 'react'
 import { MapContainer, TileLayer, Marker, useMap } from 'react-leaflet'
@@ -13,6 +12,7 @@ import {
   getCurrentReadings,
   getDailyValueFallback,
   getHeightReading,
+  getSitesInHUC,
   selectUpstreamGauges,
   selectUpstreamGaugesIncludingHeightOnly,
   selectUpstreamFromLocation,
@@ -22,6 +22,7 @@ import {
   FLOW_COLORS,
   FLOW_LABELS,
 } from './usgs'
+import { getPrecipitation } from './precip'
 import GaugeDetail from './GaugeDetail'
 
 const DEFAULT_START = {
@@ -34,10 +35,23 @@ const DEFAULT_START = {
   altitude: 646.39,
 }
 
+// Precipitation reference point: Skiatook area
+const PRECIP_LOCATION = {
+  name: 'Skiatook',
+  lat: 36.50344,
+  lon: -96.10692,
+}
+
+const FORCED_INCLUDE_SITES = [
+  '07176321', // Bird Creek at SH 99 at Pawhuska
+  '07176355', // Bird Creek Tributary at Barnsdall
+]
+
 const EXCLUDED_SITES = new Set([
   '07176950',
   '07177650',
   '07177800',
+  '07178200',
 ])
 
 const NUM_GAUGES = 8
@@ -103,46 +117,148 @@ function FitToBounds({ gauges, userLoc }) {
   return null
 }
 
-// Mode flag tells classifyMarker which path to take
 const MODE_HEIGHT = 'height'
 const MODE_FLOW = 'flow'
+
+async function resolveForcedSites(referenceHuc) {
+  const huc8 = (referenceHuc || '').slice(0, 8)
+  const huc4 = huc8.slice(0, 4)
+  const allSites = []
+  for (const huc of [huc8, huc4]) {
+    if (!huc || huc.length < 4) continue
+    try {
+      const [d, h] = await Promise.all([
+        getSitesInHUC(huc, '00060').catch(() => []),
+        getSitesInHUC(huc, '00065').catch(() => []),
+      ])
+      const seen = new Set(allSites.map((s) => s.siteNo))
+      for (const s of [...d, ...h]) {
+        if (!seen.has(s.siteNo)) {
+          allSites.push(s)
+          seen.add(s.siteNo)
+        }
+      }
+    } catch {}
+    if (FORCED_INCLUDE_SITES.every((id) => allSites.some((s) => s.siteNo === id))) break
+  }
+  const matches = []
+  for (const id of FORCED_INCLUDE_SITES) {
+    const found = allSites.find((s) => s.siteNo === id)
+    if (found) matches.push(found)
+  }
+  return matches
+}
+
+/** Compact rainfall panel shown in height mode. */
+function PrecipPanel({ data, loading, error, location }) {
+  if (loading) {
+    return (
+      <div className="precip-panel">
+        <div className="precip-title">🌧️ {location.name} rain</div>
+        <div className="precip-loading">Loading...</div>
+      </div>
+    )
+  }
+  if (error || !data) {
+    return (
+      <div className="precip-panel">
+        <div className="precip-title">🌧️ {location.name} rain</div>
+        <div className="precip-loading">No data</div>
+      </div>
+    )
+  }
+  const fmt = (n) => n.toFixed(2) + '"'
+  return (
+    <div className="precip-panel">
+      <div className="precip-title">🌧️ {location.name} rain</div>
+      <div className="precip-row">
+        <span>24h</span><strong>{fmt(data.total24h)}</strong>
+      </div>
+      <div className="precip-row">
+        <span>72h</span><strong>{fmt(data.total72h)}</strong>
+      </div>
+      <div className="precip-row">
+        <span>7-day</span><strong>{fmt(data.total7d)}</strong>
+      </div>
+    </div>
+  )
+}
 
 export default function App() {
   const [gauges, setGauges] = useState([])
   const [readings, setReadings] = useState({})
   const [medians, setMedians] = useState({})
-  const [mode, setMode] = useState(MODE_HEIGHT) // startup view = height
+  const [mode, setMode] = useState(MODE_HEIGHT)
   const [selected, setSelected] = useState(null)
   const [status, setStatus] = useState('Loading default gauges...')
   const [error, setError] = useState(null)
   const [userLoc, setUserLoc] = useState(null)
   const [loading, setLoading] = useState(true)
 
-  // === STARTUP VIEW (height mode) ===
+  const [precip, setPrecip] = useState(null)
+  const [precipLoading, setPrecipLoading] = useState(false)
+  const [precipError, setPrecipError] = useState(null)
+
+  // Load precipitation once on mount
+  useEffect(() => {
+    let cancelled = false
+    setPrecipLoading(true)
+    getPrecipitation(PRECIP_LOCATION.lat, PRECIP_LOCATION.lon)
+      .then((data) => {
+        if (cancelled) return
+        setPrecip(data)
+        setPrecipLoading(false)
+      })
+      .catch((e) => {
+        if (cancelled) return
+        console.warn('Precipitation fetch failed:', e)
+        setPrecipError(e.message || 'precip fetch failed')
+        setPrecipLoading(false)
+      })
+    return () => { cancelled = true }
+  }, [])
+
   const loadGaugesFor = useCallback(async (referenceGauge, label) => {
     setLoading(true)
     setError(null)
     setMode(MODE_HEIGHT)
     setStatus(label || 'Finding upstream gauges...')
     try {
-      const upstream = await selectUpstreamGaugesIncludingHeightOnly(
-        referenceGauge,
-        NUM_GAUGES + EXCLUDED_SITES.size
-      )
-      const filtered = upstream.filter((g) => !EXCLUDED_SITES.has(g.siteNo))
-      const all = [referenceGauge, ...filtered].slice(0, NUM_GAUGES)
-      setGauges(all)
-      setStatus(`Loading gauge heights for ${all.length} gauges...`)
-      // Pull height reading for every gauge
+      const [forced, upstream] = await Promise.all([
+        resolveForcedSites(referenceGauge.huc),
+        selectUpstreamGaugesIncludingHeightOnly(
+          referenceGauge,
+          NUM_GAUGES + EXCLUDED_SITES.size + FORCED_INCLUDE_SITES.length
+        ),
+      ])
+
+      const seen = new Set()
+      const all = []
+      function pushUnique(g) {
+        if (!g || !g.siteNo) return
+        if (seen.has(g.siteNo)) return
+        if (EXCLUDED_SITES.has(g.siteNo)) return
+        seen.add(g.siteNo)
+        all.push(g)
+      }
+      pushUnique(referenceGauge)
+      for (const g of forced) pushUnique(g)
+      for (const g of upstream) {
+        pushUnique(g)
+        if (all.length >= NUM_GAUGES) break
+      }
+      const finalList = all.slice(0, NUM_GAUGES)
+      setGauges(finalList)
+      setStatus(`Loading gauge heights for ${finalList.length} gauges...`)
+
       const heightResults = await Promise.all(
-        all.map((g) => getHeightReading(g.siteNo))
+        finalList.map((g) => getHeightReading(g.siteNo))
       )
       const r = {}
-      all.forEach((g, i) => {
+      finalList.forEach((g, i) => {
         if (heightResults[i]) r[g.siteNo] = heightResults[i]
       })
       setReadings(r)
-      // Medians don't apply in height mode
       setMedians({})
       setStatus(null)
       setLoading(false)
@@ -157,7 +273,6 @@ export default function App() {
     loadGaugesFor(DEFAULT_START, 'Loading Bird Creek and upstream gauges...')
   }, [loadGaugesFor])
 
-  // === USE MY LOCATION (flow mode) — unchanged behavior ===
   const handleUseMyLocation = useCallback(() => {
     if (!navigator.geolocation) {
       setError('Geolocation is not supported by your browser.')
@@ -184,7 +299,6 @@ export default function App() {
           setStatus(`Loading current flows for ${filtered.length} gauges...`)
           const siteNos = filtered.map((g) => g.siteNo)
           let r = await getCurrentReadings(siteNos)
-          // DV fallback only — no height fallback in this mode
           const missing = siteNos.filter((s) => !r[s])
           if (missing.length) {
             const dv = await Promise.all(missing.map((s) => getDailyValueFallback(s)))
@@ -241,7 +355,7 @@ export default function App() {
     <div className="app">
       <div className="header">
         <div>
-          <h1>🌊 Stream Gauge Map <span style={{fontSize:10,opacity:0.6}}>v1.0.6</span></h1>
+          <h1>🌊 Stream Gauge Map <span style={{fontSize:10,opacity:0.6}}>v1.0.8</span></h1>
           <div className="sub">
             {gauges.length > 0
               ? `${gauges.length} gauges · ${mode === MODE_HEIGHT ? 'height (ft)' : 'flow (cfs)'} · ${gauges[0]?.name?.split(',')[0] || ''}`
@@ -294,6 +408,16 @@ export default function App() {
           <div className="status error" onClick={() => setError(null)}>
             ⚠️ {error} (tap to dismiss)
           </div>
+        )}
+
+        {/* Precipitation panel - only shown in height (startup) mode */}
+        {mode === MODE_HEIGHT && (
+          <PrecipPanel
+            data={precip}
+            loading={precipLoading}
+            error={precipError}
+            location={PRECIP_LOCATION}
+          />
         )}
 
         <div className="legend">
